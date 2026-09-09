@@ -863,6 +863,44 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
+static bool cross_file_call_to_owner_has_strategy(cbm_store_t *s, const char *project,
+                                                  const char *src_name, const char *tgt_name,
+                                                  const char *owner_fragment,
+                                                  const char *strategy_fragment) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].qualified_name &&
+                    strstr(tgts[k].qualified_name, owner_fragment) && edges[j].properties_json &&
+                    strstr(edges[j].properties_json, strategy_fragment)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
 /* True iff the exact named CALLS edge exists and its serialized strategy
  * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
  * this on a separate ordinary-call control: it proves the cross-file LSP ran
@@ -2278,7 +2316,7 @@ TEST(pipeline_complexity_props_independent_of_worker_order) {
     ASSERT_EQ(sequential_rc, 0);
     ASSERT_NOT_NULL(sequential_sig);
     ASSERT_GTE(sequential_funcs, copied); /* at least the one function per fixture file */
-    ASSERT_TRUE(cycles_detected);        /* the cycles must reach the pass at all */
+    ASSERT_TRUE(cycles_detected);         /* the cycles must reach the pass at all */
     if (mismatch_run >= 0) {
         printf("\n    parallel run %d diverges from sequential: %s\n", mismatch_run, diff);
         FAIL("complexity props depend on worker id order");
@@ -5253,6 +5291,96 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
+static void write_scala_import_alias_fixture(const char *tmp) {
+    write_temp_file(tmp, "alias_targets.scala",
+                    "package alias_targets\n"
+                    "object CorrectObject { def execute(): Int = 1 }\n"
+                    "object WrongObject { def execute(): Int = 2 }\n"
+                    "object ExternalStateRef { def make(): Int = 3 }\n");
+    write_temp_file(tmp, "alias_caller.scala",
+                    "package alias_caller\n"
+                    "import alias_targets.{CorrectObject => ImportedAlias}\n"
+                    "import outside.library.ExternalStateRef\n"
+                    "object AliasCalls {\n"
+                    "  def invokeAlias(): Int = ImportedAlias.execute()\n"
+                    "  def invokeExternal(): Int = ExternalStateRef.make()\n"
+                    "}\n");
+}
+
+static bool scala_import_alias_edge_is_exact(cbm_store_t *s, const char *project) {
+    cbm_edge_t *imports = NULL;
+    int import_count = 0;
+    bool exact_call = cross_file_call_to_owner_has_strategy(s, project, "invokeAlias", "execute",
+                                                            "CorrectObject.execute", "import_map");
+    cbm_store_find_edges_by_type(s, project, "IMPORTS", &imports, &import_count);
+    if (imports) {
+        cbm_store_free_edges(imports, import_count);
+    }
+    return exact_call && import_count == 1;
+}
+
+TEST(pipeline_scala_import_alias_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "alias_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object AliasFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -7137,19 +7265,18 @@ TEST(pipeline_python_cross_module_call) {
  * unique_name (candidates==1) is #1572 and is not this claim. */
 TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
-    const char *contents[] = {
-        "class Store:\n"
-        "    def commit(self):\n"
-        "        return True\n",
+    const char *contents[] = {"class Store:\n"
+                              "    def commit(self):\n"
+                              "        return True\n",
 
-        "from store import Store\n"
-        "\n"
-        "def save():\n"
-        "    return Store().commit()\n",
+                              "from store import Store\n"
+                              "\n"
+                              "def save():\n"
+                              "    return Store().commit()\n",
 
-        "export function commit() {\n"
-        "  return 1;\n"
-        "}\n"};
+                              "export function commit() {\n"
+                              "  return 1;\n"
+                              "}\n"};
 
     if (setup_lang_repo(files, contents, 3) != 0)
         FAIL("tmpdir");
@@ -13723,7 +13850,6 @@ TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
     PASS();
 }
 
-
 /* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
  * `body` → findable. Each layer has its own test; this one proves they connect.
  * It is also the guard on the size budget: build_def_props drops an oversized
@@ -13984,6 +14110,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
+    RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
