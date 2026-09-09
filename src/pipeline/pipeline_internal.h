@@ -158,6 +158,12 @@ static inline bool cbm_pipeline_result_has_bases(const CBMFileResult *result) {
     return false;
 }
 
+/* Resolve `super.method()` against one unambiguous direct Scala base type. */
+cbm_resolution_t cbm_resolve_scala_super_receiver(const CBMFileResult *result, const CBMCall *call,
+                                                  const cbm_registry_t *registry,
+                                                  const char *module_qn, const char **import_keys,
+                                                  const char **import_vals, int import_count);
+
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */

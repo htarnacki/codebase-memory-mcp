@@ -5644,6 +5644,25 @@ TEST(extract_scala_package_namespace) {
     PASS();
 }
 
+TEST(extract_scala_super_call_keeps_receiver) {
+    CBMFileResult *r = extract("class Parent { def execute(): Int = 1 }\n"
+                               "class Child extends Parent {\n"
+                               "  override def execute(): Int = super.execute()\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Super.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *call = find_call_by_callee(r, "super.execute");
+    ASSERT_NOT_NULL(call);
+    ASSERT_TRUE(call->is_method);
+    const CBMDefinition *child = find_def_by_name(r, "Child");
+    ASSERT_NOT_NULL(child);
+    ASSERT_NOT_NULL(child->base_classes);
+    ASSERT_STR_EQ(child->base_classes[0], "Parent");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* this/super receivers keep the enclosing-class target, where a weak
  * namespace-proximity match is usually correct — so they are NOT flagged. A
  * new_expression has no member receiver and is never flagged either. */
@@ -7290,6 +7309,7 @@ SUITE(extraction) {
     RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
+    RUN_TEST(extract_scala_super_call_keeps_receiver);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
 

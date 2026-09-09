@@ -5685,6 +5685,86 @@ TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
     PASS();
 }
 
+static void write_scala_super_fixture(const char *tmp) {
+    write_temp_file(tmp, "super_targets.scala",
+                    "package super_targets\n"
+                    "class Parent { def execute(): Int = 1 }\n"
+                    "class WrongParent { def execute(): Int = 2 }\n");
+    write_temp_file(tmp, "super_caller.scala",
+                    "package super_caller\n"
+                    "import super_targets.Parent\n"
+                    "class Child extends Parent {\n"
+                    "  override def execute(): Int = super.execute()\n"
+                    "}\n");
+}
+
+static bool scala_super_edge_is_exact(cbm_store_t *s, const char *project) {
+    return cross_file_call_to_owner_has_strategy(s, project, "execute", "execute",
+                                                 "Parent.execute", "scala_super");
+}
+
+TEST(pipeline_scala_super_resolves_direct_base_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_super_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_super_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_super.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_super_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_super_parallel_resolves_direct_base_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_super_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_super_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "super_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object SuperFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_super_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_super_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -14413,6 +14493,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_receiver_suppresses_weak_method_edges);
     RUN_TEST(pipeline_scala_explicit_receiver_types_resolve_exact_method);
     RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
+    RUN_TEST(pipeline_scala_super_resolves_direct_base_method);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
@@ -14423,6 +14504,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_explicit_receiver_types_parallel_resolve_exact_method);
     RUN_TEST(pipeline_scala_inherited_receiver_incremental_matches_fresh_full);
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
+    RUN_TEST(pipeline_scala_super_parallel_resolves_direct_base_method);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

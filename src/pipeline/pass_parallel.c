@@ -2537,8 +2537,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                        imp_vals, imp_count);
         }
         if (!lsp_target && lang == CBM_LANG_SCALA && call->is_method) {
-            cbm_resolution_t scala = cbm_resolve_scala_typed_receiver(
+            cbm_resolution_t scala = cbm_resolve_scala_super_receiver(
                 result, call, rc->registry, module_qn, imp_keys, imp_vals, imp_count);
+            if (!scala.qualified_name || !scala.qualified_name[0]) {
+                scala = cbm_resolve_scala_typed_receiver(result, call, rc->registry, module_qn,
+                                                         imp_keys, imp_vals, imp_count);
+            }
             if (scala.qualified_name && scala.qualified_name[0]) {
                 res = scala;
             }

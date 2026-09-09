@@ -792,6 +792,79 @@ cbm_resolution_t cbm_resolve_scala_typed_receiver(const CBMFileResult *result, c
     return resolved;
 }
 
+static const CBMDefinition *scala_enclosing_type(const CBMFileResult *result, const CBMCall *call) {
+    const CBMDefinition *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (!def->qualified_name || !cbm_label_is_type_like(def->label) ||
+            !scala_scope_contains(def->qualified_name, call->enclosing_func_qn)) {
+            continue;
+        }
+        size_t len = strlen(def->qualified_name);
+        if (len > best_len) {
+            best = def;
+            best_len = len;
+        }
+    }
+    return best;
+}
+
+cbm_resolution_t cbm_resolve_scala_super_receiver(const CBMFileResult *result, const CBMCall *call,
+                                                  const cbm_registry_t *registry,
+                                                  const char *module_qn, const char **import_keys,
+                                                  const char **import_vals, int import_count) {
+    cbm_resolution_t empty = {0};
+    if (!result || !call || !call->callee_name || !registry ||
+        strncmp(call->callee_name, "super.", 6) != 0 || strchr(call->callee_name + 6, '.')) {
+        return empty;
+    }
+    const char *method = call->callee_name + 6;
+    if (!method[0]) {
+        return empty;
+    }
+    const CBMDefinition *owner = scala_enclosing_type(result, call);
+    if (!owner || !owner->base_classes) {
+        return empty;
+    }
+
+    const char *match = NULL;
+    int matches = 0;
+    for (int i = 0; owner->base_classes[i]; i++) {
+        cbm_resolution_t base = cbm_registry_resolve(registry, owner->base_classes[i], module_qn,
+                                                     import_keys, import_vals, import_count);
+        if (!base.qualified_name ||
+            !cbm_label_is_type_like(cbm_registry_label_of(registry, base.qualified_name))) {
+            continue;
+        }
+        char target[CBM_SZ_2K];
+        int n = snprintf(target, sizeof(target), "%s.%s", base.qualified_name, method);
+        if (n <= 0 || (size_t)n >= sizeof(target) || !cbm_registry_label_of(registry, target)) {
+            continue;
+        }
+        const char **candidates = NULL;
+        int candidate_count = 0;
+        if (cbm_registry_find_by_name(registry, method, &candidates, &candidate_count) != 0) {
+            continue;
+        }
+        for (int c = 0; c < candidate_count; c++) {
+            if (strcmp(candidates[c], target) == 0) {
+                match = candidates[c];
+                matches++;
+                break;
+            }
+        }
+    }
+    if (matches != 1) {
+        return empty;
+    }
+    cbm_resolution_t resolved = {.qualified_name = match,
+                                 .strategy = "scala_super",
+                                 .confidence = 0.98,
+                                 .candidate_count = 1};
+    return resolved;
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS;
