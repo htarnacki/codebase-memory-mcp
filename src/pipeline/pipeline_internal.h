@@ -138,6 +138,26 @@ typedef struct {
     const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
+/* Resolve a Scala member call from an explicit receiver type recorded in the
+ * same extraction result. Returns an empty result unless both the binding and
+ * exactly one method owner are unambiguous. */
+cbm_resolution_t cbm_resolve_scala_typed_receiver(const CBMFileResult *result, const CBMCall *call,
+                                                  const cbm_registry_t *registry,
+                                                  const char *module_qn, const char **import_keys,
+                                                  const char **import_vals, int import_count);
+
+static inline bool cbm_pipeline_result_has_bases(const CBMFileResult *result) {
+    if (!result) {
+        return false;
+    }
+    for (int i = 0; i < result->defs.count; i++) {
+        if (result->defs.items[i].base_classes && result->defs.items[i].base_classes[0]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */

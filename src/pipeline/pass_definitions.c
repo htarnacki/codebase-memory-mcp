@@ -20,6 +20,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include <stdint.h>
 #include <ctype.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -912,6 +913,17 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                                           files[i].language, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
+            if (files[i].language == CBM_LANG_SCALA && cbm_pipeline_result_has_bases(result)) {
+                const char **keys = NULL;
+                const char **vals = NULL;
+                int count = 0;
+                cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                         files[i].language, result, &keys, &vals, &count);
+                char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, files[i].rel_path);
+                cbm_registry_register_bases(ctx->registry, result, module_qn, keys, vals, count);
+                free(module_qn);
+                cbm_pxc_free_import_map(keys, vals, count);
+            }
         }
         cbm_pipeline_namespace_map_free(namespace_map);
         if (owns_local_cache) {

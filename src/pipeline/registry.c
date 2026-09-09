@@ -86,6 +86,10 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+
+    /* resolved type QN -> direct base type QNs. Keys are owned here; array
+     * entries borrow exact-map keys and therefore outlive all resolution. */
+    CBMHashTable *bases;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -501,6 +505,293 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
     return weak_short_name_strategy(strategy);
 }
 
+static bool scala_scope_contains(const char *scope_qn, const char *call_qn) {
+    if (!scope_qn || !scope_qn[0] || !call_qn || !call_qn[0]) {
+        return false;
+    }
+    size_t n = strlen(scope_qn);
+    return strncmp(scope_qn, call_qn, n) == 0 && (call_qn[n] == '\0' || call_qn[n] == '.');
+}
+
+static const char *scala_receiver_name(const CBMCall *call, char *out, size_t out_size) {
+    if (!call || !call->is_method || !call->callee_name || !out || out_size < 2) {
+        return NULL;
+    }
+    const char *dot = strchr(call->callee_name, '.');
+    if (!dot || dot == call->callee_name || strchr(dot + 1, '.')) {
+        return NULL; /* simple `receiver.method` only; fail closed on chains */
+    }
+    size_t n = (size_t)(dot - call->callee_name);
+    if (n >= out_size) {
+        return NULL;
+    }
+    memcpy(out, call->callee_name, n);
+    out[n] = '\0';
+    if (strcmp(out, "_") == 0 || strcmp(out, "this") == 0 || strcmp(out, "super") == 0) {
+        return NULL;
+    }
+    return out;
+}
+
+static const char *scala_type_from_params(const CBMDefinition *def, const char *receiver) {
+    if (!def || !def->param_names || !def->signature_param_types || !receiver) {
+        return NULL;
+    }
+    for (int i = 0; def->param_names[i] && i < def->signature_param_count; i++) {
+        if (strcmp(def->param_names[i], receiver) == 0 && def->signature_param_types[i] &&
+            strcmp(def->signature_param_types[i], "?") != 0) {
+            return def->signature_param_types[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *scala_explicit_receiver_type(const CBMFileResult *result, const CBMCall *call,
+                                                const char *receiver) {
+    const char *best = NULL;
+    size_t best_scope = 0;
+    bool ambiguous = false;
+
+    /* A local/class-body annotated val shadows parameters and outer bindings. */
+    for (int i = 0; i < result->type_assigns.count; i++) {
+        const CBMTypeAssign *ta = &result->type_assigns.items[i];
+        if (!ta->var_name || strcmp(ta->var_name, receiver) != 0 || !ta->type_name ||
+            !scala_scope_contains(ta->enclosing_func_qn, call->enclosing_func_qn)) {
+            continue;
+        }
+        size_t scope_len = strlen(ta->enclosing_func_qn);
+        if (scope_len > best_scope) {
+            best = ta->type_name;
+            best_scope = scope_len;
+            ambiguous = false;
+        } else if (scope_len == best_scope && best && strcmp(best, ta->type_name) != 0) {
+            ambiguous = true;
+        }
+    }
+    if (best_scope > 0) {
+        return ambiguous ? NULL : best;
+    }
+
+    /* Then inspect the exact enclosing function/method parameters. */
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (def->qualified_name && call->enclosing_func_qn &&
+            strcmp(def->qualified_name, call->enclosing_func_qn) == 0) {
+            const char *type = scala_type_from_params(def, receiver);
+            if (type) {
+                return type;
+            }
+        }
+    }
+
+    /* Finally use the nearest enclosing class's primary-constructor binding. */
+    const char *class_type = NULL;
+    size_t class_scope = 0;
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (!def->qualified_name || !cbm_label_is_type_like(def->label) ||
+            !scala_scope_contains(def->qualified_name, call->enclosing_func_qn)) {
+            continue;
+        }
+        const char *type = scala_type_from_params(def, receiver);
+        size_t scope_len = strlen(def->qualified_name);
+        if (type && scope_len > class_scope) {
+            class_type = type;
+            class_scope = scope_len;
+        }
+    }
+    return class_type;
+}
+
+static bool scala_type_leaf(const char *type_text, char *out, size_t out_size) {
+    if (!type_text || !out || out_size < 2) {
+        return false;
+    }
+    while (*type_text == ' ' || *type_text == '\t') {
+        type_text++;
+    }
+    const char *end = type_text;
+    while (*end && *end != '[' && *end != ' ' && *end != '\t' && *end != '\n') {
+        end++;
+    }
+    if (end == type_text || (*end && *end != '[')) {
+        return false;
+    }
+    const char *leaf = end;
+    while (leaf > type_text && leaf[-1] != '.' && leaf[-1] != '#') {
+        leaf--;
+    }
+    size_t n = (size_t)(end - leaf);
+    if (n == 0 || n >= out_size) {
+        return false;
+    }
+    memcpy(out, leaf, n);
+    out[n] = '\0';
+    return true;
+}
+
+enum { SCALA_BASE_DEPTH_MAX = 32 };
+
+static bool scala_callable_target(const cbm_registry_t *registry, const char *qn) {
+    const char *label = cbm_registry_label_of(registry, qn);
+    return label && (strcmp(label, "Method") == 0 || strcmp(label, "Function") == 0);
+}
+
+static const char *scala_unique_direct_method(const cbm_registry_t *registry, const char *type_name,
+                                              const char *method) {
+    const char **candidates = NULL;
+    int candidate_count = 0;
+    if (cbm_registry_find_by_name(registry, method, &candidates, &candidate_count) != 0) {
+        return NULL;
+    }
+    const char *match = NULL;
+    size_t type_len = strlen(type_name);
+    size_t method_len = strlen(method);
+    for (int i = 0; i < candidate_count; i++) {
+        const char *qn = candidates[i];
+        size_t qn_len = strlen(qn);
+        if (!scala_callable_target(registry, qn) || qn_len <= method_len + 1 ||
+            strcmp(qn + qn_len - method_len, method) != 0 || qn[qn_len - method_len - 1] != '.') {
+            continue;
+        }
+        const char *owner_end = qn + qn_len - method_len - 1;
+        const char *owner = owner_end;
+        while (owner > qn && owner[-1] != '.') {
+            owner--;
+        }
+        if ((size_t)(owner_end - owner) == type_len && memcmp(owner, type_name, type_len) == 0) {
+            if (match) {
+                return NULL;
+            }
+            match = qn;
+        }
+    }
+    return match;
+}
+
+static void scala_find_inherited_method(const cbm_registry_t *registry, const char *owner_qn,
+                                        const char *method, const char **visited,
+                                        int *visited_count, const char **match, int *matches,
+                                        int depth) {
+    if (depth >= SCALA_BASE_DEPTH_MAX || *visited_count >= SCALA_BASE_DEPTH_MAX || *matches > 1) {
+        return;
+    }
+    for (int i = 0; i < *visited_count; i++) {
+        if (strcmp(visited[i], owner_qn) == 0) {
+            return;
+        }
+    }
+    visited[(*visited_count)++] = owner_qn;
+    qn_array_t *bases = cbm_ht_get(registry->bases, owner_qn);
+    if (!bases) {
+        return;
+    }
+    for (int i = 0; i < bases->count; i++) {
+        const char *base_qn = bases->items[i];
+        char target[CBM_SZ_2K];
+        int n = snprintf(target, sizeof(target), "%s.%s", base_qn, method);
+        if (n > 0 && (size_t)n < sizeof(target) && scala_callable_target(registry, target)) {
+            const char *owned = cbm_ht_get_key(registry->exact, target);
+            if (owned && (!*match || strcmp(*match, owned) != 0)) {
+                *match = owned;
+                (*matches)++;
+            }
+        } else {
+            scala_find_inherited_method(registry, base_qn, method, visited, visited_count, match,
+                                        matches, depth + 1);
+        }
+    }
+}
+
+cbm_resolution_t cbm_resolve_scala_typed_receiver(const CBMFileResult *result, const CBMCall *call,
+                                                  const cbm_registry_t *registry,
+                                                  const char *module_qn, const char **import_keys,
+                                                  const char **import_vals, int import_count) {
+    cbm_resolution_t empty = {0};
+    if (!result || !call || !registry) {
+        return empty;
+    }
+    char receiver[CBM_SZ_256];
+    if (!scala_receiver_name(call, receiver, sizeof(receiver))) {
+        return empty;
+    }
+    const char *type_text = scala_explicit_receiver_type(result, call, receiver);
+    char type_name[CBM_SZ_256];
+    if (!scala_type_leaf(type_text, type_name, sizeof(type_name))) {
+        return empty;
+    }
+
+    const char *method = strrchr(call->callee_name, '.');
+    method = method ? method + 1 : NULL;
+    if (!method || !method[0]) {
+        return empty;
+    }
+    cbm_resolution_t owner = cbm_registry_resolve(registry, type_name, module_qn, import_keys,
+                                                  import_vals, import_count);
+    if (!owner.qualified_name ||
+        !cbm_label_is_type_like(cbm_registry_label_of(registry, owner.qualified_name))) {
+        return empty;
+    }
+
+    if (owner.candidate_count != 1) {
+        const char *direct = scala_unique_direct_method(registry, type_name, method);
+        if (direct) {
+            return (cbm_resolution_t){
+                .qualified_name = direct,
+                .strategy = "scala_receiver_type",
+                .confidence = 0.97,
+                .candidate_count = 1,
+            };
+        }
+        /* A same-named receiver type can exist in several packages (for example
+         * parallel v1/v2 controllers). The registry's suffix resolver already
+         * requires a unique best import-distance candidate. Preserve that
+         * package-proximity choice when the selected owner directly declares
+         * the requested method instead of discarding every ambiguous type. */
+        char proximity_target[CBM_SZ_2K];
+        int n = snprintf(proximity_target, sizeof(proximity_target), "%s.%s", owner.qualified_name,
+                         method);
+        if (!owner.strategy || strcmp(owner.strategy, "suffix_match") != 0 || n <= 0 ||
+            (size_t)n >= sizeof(proximity_target) ||
+            !scala_callable_target(registry, proximity_target)) {
+            return empty;
+        }
+        return (cbm_resolution_t){
+            .qualified_name = cbm_ht_get_key(registry->exact, proximity_target),
+            .strategy = "scala_receiver_type_proximity",
+            .confidence = owner.confidence,
+            .candidate_count = owner.candidate_count,
+        };
+    }
+
+    char target[CBM_SZ_2K];
+    int n = snprintf(target, sizeof(target), "%s.%s", owner.qualified_name, method);
+    const char *match = NULL;
+    const char *strategy = "scala_receiver_type";
+    double confidence = 0.97;
+    if (n > 0 && (size_t)n < sizeof(target) && scala_callable_target(registry, target)) {
+        match = cbm_ht_get_key(registry->exact, target);
+    } else {
+        const char *visited[SCALA_BASE_DEPTH_MAX];
+        int visited_count = 0;
+        int matches = 0;
+        scala_find_inherited_method(registry, owner.qualified_name, method, visited, &visited_count,
+                                    &match, &matches, 0);
+        if (matches != 1) {
+            return empty;
+        }
+        strategy = "scala_receiver_inherited";
+        confidence = 0.96;
+    }
+    cbm_resolution_t resolved = {
+        .qualified_name = match,
+        .strategy = strategy,
+        .confidence = confidence,
+        .candidate_count = 1,
+    };
+    return resolved;
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS;
@@ -609,6 +900,7 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
+    r->bases = cbm_ht_create(CBM_SZ_256);
     return r;
 }
 
@@ -636,6 +928,8 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    cbm_ht_foreach(r->bases, free_qn_array, NULL);
+    cbm_ht_free(r->bases);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -690,6 +984,53 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         cbm_ht_set(r->by_name, strdup(simple), arr);
     }
     cbm_da_push(arr, (char *)owned_qn);
+}
+
+void cbm_registry_add_base(cbm_registry_t *r, const char *owner_qn, const char *base_qn) {
+    if (!r || !owner_qn || !base_qn || strcmp(owner_qn, base_qn) == 0 ||
+        !cbm_label_is_type_like(cbm_registry_label_of(r, owner_qn)) ||
+        !cbm_label_is_type_like(cbm_registry_label_of(r, base_qn))) {
+        return;
+    }
+    qn_array_t *arr = cbm_ht_get(r->bases, owner_qn);
+    if (!arr) {
+        arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
+        if (!arr) {
+            return;
+        }
+        cbm_ht_set(r->bases, strdup(owner_qn), arr);
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (strcmp(arr->items[i], base_qn) == 0) {
+            return;
+        }
+    }
+    const char *owned_base = cbm_ht_get_key(r->exact, base_qn);
+    if (owned_base) {
+        cbm_da_push(arr, (char *)owned_base);
+    }
+}
+
+void cbm_registry_register_bases(cbm_registry_t *r, const CBMFileResult *result,
+                                 const char *module_qn, const char **import_map_keys,
+                                 const char **import_map_vals, int import_map_count) {
+    if (!r || !result) {
+        return;
+    }
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!def->qualified_name || !cbm_label_is_type_like(def->label) || !def->base_classes) {
+            continue;
+        }
+        for (int b = 0; def->base_classes[b]; b++) {
+            cbm_resolution_t base =
+                cbm_registry_resolve(r, def->base_classes[b], module_qn, import_map_keys,
+                                     import_map_vals, import_map_count);
+            if (base.qualified_name && base.candidate_count == 1) {
+                cbm_registry_add_base(r, def->qualified_name, base.qualified_name);
+            }
+        }
+    }
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */

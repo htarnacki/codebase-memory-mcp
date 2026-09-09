@@ -216,6 +216,14 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* Resolve and register type inheritance metadata after every definition is in
+ * the registry. The resulting owner -> base links are immutable during call
+ * resolution and let typed receivers follow only proven inheritance paths. */
+void cbm_registry_register_bases(cbm_registry_t *r, const CBMFileResult *result,
+                                 const char *module_qn, const char **import_map_keys,
+                                 const char **import_map_vals, int import_map_count);
+void cbm_registry_add_base(cbm_registry_t *r, const char *owner_qn, const char *base_qn);
+
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved.

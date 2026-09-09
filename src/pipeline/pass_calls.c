@@ -475,7 +475,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
-static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
+static int resolve_single_call(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
@@ -508,6 +508,22 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
+        }
+    }
+
+    /* Scala methods whose entire argument list is implicit appear as bare
+     * field_expression nodes. Their carriers are exact-only: accept one only
+     * when receiver type inference proves a concrete callable target. */
+    if (call->requires_lsp_resolution && lang == CBM_LANG_SCALA && call->is_method) {
+        cbm_resolution_t scala = cbm_resolve_scala_typed_receiver(
+            result, call, ctx->registry, module_qn, imp_keys, imp_vals, imp_count);
+        if (scala.qualified_name && scala.qualified_name[0]) {
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, scala.qualified_name);
+            if (target && source_node->id != target->id) {
+                emit_classified_edge(ctx, call, source_node, target, &scala, module_qn, imp_keys,
+                                     imp_vals, imp_count, false);
+                return SKIP_ONE;
+            }
         }
     }
 
@@ -546,6 +562,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
+    if (lang == CBM_LANG_SCALA && call->is_method) {
+        cbm_resolution_t scala = cbm_resolve_scala_typed_receiver(
+            result, call, ctx->registry, module_qn, imp_keys, imp_vals, imp_count);
+        if (scala.qualified_name && scala.qualified_name[0]) {
+            res = scala;
+        }
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
@@ -827,8 +850,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, result, call, &result->resolved_calls, rel, module_qn,
+                                    imp_keys, imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;

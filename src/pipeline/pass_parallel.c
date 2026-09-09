@@ -1395,6 +1395,25 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
     }
 
+    /* All symbols and IMPORTS edges now exist. Resolve Scala bases once into
+     * the immutable registry before parallel call workers read it. */
+    for (int i = 0; i < file_count; i++) {
+        CBMFileResult *result = result_cache[i];
+        if (!result || files[i].language != CBM_LANG_SCALA ||
+            !cbm_pipeline_result_has_bases(result)) {
+            continue;
+        }
+        const char **keys = NULL;
+        const char **vals = NULL;
+        int count = 0;
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, files[i].language,
+                                 result, &keys, &vals, &count);
+        char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, files[i].rel_path);
+        cbm_registry_register_bases(ctx->registry, result, module_qn, keys, vals, count);
+        free(module_qn);
+        cbm_pxc_free_import_map(keys, vals, count);
+    }
+
     cbm_pipeline_namespace_map_free(namespace_map);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
@@ -2517,13 +2536,22 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
+        if (!lsp_target && lang == CBM_LANG_SCALA && call->is_method) {
+            cbm_resolution_t scala = cbm_resolve_scala_typed_receiver(
+                result, call, rc->registry, module_qn, imp_keys, imp_vals, imp_count);
+            if (scala.qualified_name && scala.qualified_name[0]) {
+                res = scala;
+            }
+        }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
 
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
          * route, or service heuristics manufacture a target for it. */
-        if (call->requires_lsp_resolution && !lsp_target) {
+        bool scala_typed_exact = lang == CBM_LANG_SCALA && call->is_method && res.qualified_name &&
+                                 res.qualified_name[0];
+        if (call->requires_lsp_resolution && !lsp_target && !scala_typed_exact) {
             continue;
         }
 

@@ -5388,6 +5388,213 @@ TEST(pipeline_scala_receiver_parallel_suppresses_weak_method_edges) {
     PASS();
 }
 
+static void write_scala_typed_receiver_fixture(const char *tmp) {
+    write_temp_file(tmp, "base_targets.scala",
+                    "package base_targets\n"
+                    "class BaseReceiver { def inherited(): Int = 3 }\n");
+    write_temp_file(tmp, "targets.scala",
+                    "package targets\n"
+                    "import base_targets.BaseReceiver\n"
+                    "class CorrectReceiver extends BaseReceiver {\n"
+                    "  def execute(): Int = 1\n"
+                    "  def implicitExecute(implicit token: Int): Int = 4\n"
+                    "}\n"
+                    "class WrongReceiver { def execute(): Int = 2 }\n");
+    write_temp_file(
+        tmp, "caller.scala",
+        "package caller\n"
+        "import targets.CorrectReceiver\n"
+        "class ConstructorUser(val service: CorrectReceiver) {\n"
+        "  def fromConstructor(): Int = service.execute()\n"
+        "  private lazy val inferred = new CorrectReceiver\n"
+        "  def fromImplicitSelection()(implicit token: Int): Int = inferred.implicitExecute\n"
+        "  def fromNestedLambda(): Int = Wrapper.blocking { implicit request =>\n"
+        "    service.execute()\n"
+        "  }\n"
+        "}\n"
+        "object Wrapper { def blocking(f: Int => Int): Int = f(1) }\n"
+        "object Calls {\n"
+        "  def fromParam(service: CorrectReceiver): Int = service.execute()\n"
+        "  def inheritedFromParam(service: CorrectReceiver): Int = service.inherited()\n"
+        "  def fromLocal(): Int = {\n"
+        "    val service: CorrectReceiver = new CorrectReceiver()\n"
+        "    service.execute()\n"
+        "  }\n"
+        "}\n");
+    cbm_mkdir_p(TH_PATH(tmp, "shop/v1"), 0755);
+    cbm_mkdir_p(TH_PATH(tmp, "shop/v2"), 0755);
+    write_temp_file(tmp, "shop/v1/InvoiceApiController.scala",
+                    "package shop.v1\n"
+                    "class InvoiceApiController {\n"
+                    "  def retrieveInvoice(uid: String)(implicit request: Int): Int = 1\n"
+                    "}\n");
+    write_temp_file(tmp, "shop/v2/InvoiceApiController.scala",
+                    "package shop.v2\n"
+                    "class InvoiceApiController {\n"
+                    "  def retrieveInvoice(uid: String)(implicit request: Int): Int = 2\n"
+                    "}\n");
+    write_temp_file(
+        tmp, "shop/v2/InvoicingApiController.scala",
+        "package shop.v2\n"
+        "class InvoicingApiController {\n"
+        "  private lazy val invoiceHandler: InvoiceApiController =\n"
+        "    new InvoiceApiController\n"
+        "  def retrieveInvoice(uid: String): Int = Action.blocking { implicit request =>\n"
+        "    invoiceHandler.retrieveInvoice(uid)\n"
+        "  }\n"
+        "}\n"
+        "object Action { def blocking(f: Int => Int): Int = f(1) }\n");
+    write_temp_file(tmp, "v1_VersionedController.scala",
+                    "class VersionedController { def versionOnly(): Int = 1 }\n");
+    write_temp_file(tmp, "v1_VersionedCaller.scala",
+                    "class VersionedCaller {\n"
+                    "  def versionedCall(controller: VersionedController): Int = "
+                    "controller.versionOnly()\n"
+                    "}\n");
+    write_temp_file(tmp, "v2_VersionedController.scala",
+                    "class VersionedController { def other(): Int = 2 }\n");
+}
+
+static bool scala_typed_receiver_edges_are_exact(cbm_store_t *s, const char *project) {
+    const char *owner = "CorrectReceiver.execute";
+    const char *strategy = "scala_receiver_type";
+    bool om_correct = cross_file_call_to_owner_has_strategy(
+        s, project, "retrieveInvoice", "retrieveInvoice",
+        "shop.v2.InvoiceApiController.InvoiceApiController.retrieveInvoice",
+        "scala_receiver_type_proximity");
+    bool om_wrong = cross_file_call_to_owner_has_strategy(
+        s, project, "retrieveInvoice", "retrieveInvoice",
+        "shop.v1.InvoiceApiController.InvoiceApiController.retrieveInvoice",
+        "scala_receiver_type_proximity");
+    return cross_file_call_to_owner_has_strategy(s, project, "fromConstructor", "execute", owner,
+                                                 strategy) &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromParam", "execute", owner,
+                                                 strategy) &&
+           cross_file_call_to_owner_has_strategy(s, project, "inheritedFromParam", "inherited",
+                                                 "BaseReceiver.inherited",
+                                                 "scala_receiver_inherited") &&
+           cross_file_call_to_owner_has_strategy(s, project, "versionedCall", "versionOnly",
+                                                 "VersionedController.versionOnly", strategy) &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromLocal", "execute", owner,
+                                                 strategy) &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromNestedLambda", "execute", owner,
+                                                 strategy) &&
+           om_correct && !om_wrong &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromImplicitSelection",
+                                                 "implicitExecute",
+                                                 "CorrectReceiver.implicitExecute", strategy);
+}
+
+TEST(pipeline_scala_explicit_receiver_types_resolve_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_typed_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_typed_receiver_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_typed.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_typed_receiver_edges_are_exact(s, cbm_pipeline_project_name(p)));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_explicit_receiver_types_parallel_resolve_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_typed_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_typed_receiver_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.scala", i);
+        snprintf(body, sizeof(body), "object TypedFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_typed_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_typed_receiver_edges_are_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_inherited_receiver_incremental_matches_fresh_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_inherited_incr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_scala_typed_receiver_fixture(tmp);
+
+    char incremental_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    cbm_pipeline_free(baseline);
+
+    char caller_path[512];
+    snprintf(caller_path, sizeof(caller_path), "%s/caller.scala", tmp);
+    ASSERT_EQ(th_append_file(caller_path, "\n// caller-only incremental edit\n"), 0);
+
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    const char *incremental_project = cbm_pipeline_project_name(incremental);
+    cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(incremental_store);
+    bool incremental_ok = cross_file_call_to_owner_has_strategy(
+        incremental_store, incremental_project, "inheritedFromParam", "inherited",
+        "BaseReceiver.inherited", "scala_receiver_inherited");
+    cbm_store_close(incremental_store);
+    cbm_pipeline_free(incremental);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    const char *full_project = cbm_pipeline_project_name(full);
+    cbm_store_t *full_store = cbm_store_open_path(full_db);
+    ASSERT_NOT_NULL(full_store);
+    bool full_ok = cross_file_call_to_owner_has_strategy(
+        full_store, full_project, "inheritedFromParam", "inherited", "BaseReceiver.inherited",
+        "scala_receiver_inherited");
+    cbm_store_close(full_store);
+    cbm_pipeline_free(full);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(incremental_ok);
+    ASSERT_TRUE(full_ok);
+    PASS();
+}
+
 static void write_scala_import_alias_fixture(const char *tmp) {
     write_temp_file(tmp, "alias_targets.scala",
                     "package alias_targets\n"
@@ -14203,6 +14410,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_scala_receiver_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_scala_explicit_receiver_types_resolve_exact_method);
+    RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
@@ -14210,6 +14420,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
     RUN_TEST(pipeline_scala_receiver_suppresses_weak_method_edges);
     RUN_TEST(pipeline_scala_receiver_parallel_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_scala_explicit_receiver_types_parallel_resolve_exact_method);
+    RUN_TEST(pipeline_scala_inherited_receiver_incremental_matches_fresh_full);
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);

@@ -1043,6 +1043,49 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    cbm_registry_t *registry;
+} registry_base_seed_t;
+
+static void registry_base_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
+    if (!edge->type || strcmp(edge->type, "INHERITS") != 0) {
+        return;
+    }
+    registry_base_seed_t *seed = (registry_base_seed_t *)userdata;
+    const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(seed->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *base = cbm_gbuf_find_by_id(seed->gbuf, edge->target_id);
+    if (owner && base) {
+        cbm_registry_add_base(seed->registry, owner->qualified_name, base->qualified_name);
+    }
+}
+
+/* The closure-delta graph intentionally preseeds nodes without edges. Recover
+ * persisted inheritance directly from the staging database before resolving
+ * changed callers; failure forces the safe full-reindex fallback. */
+static int registry_seed_bases_from_store(cbm_store_t *store, const char *project,
+                                          cbm_registry_t *registry) {
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    if (!db ||
+        sqlite3_prepare_v2(db,
+                           "SELECT s.qualified_name,t.qualified_name FROM edges e "
+                           "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                           "WHERE e.type='INHERITS' AND s.project=?1",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *owner = (const char *)sqlite3_column_text(stmt, 0);
+        const char *base = (const char *)sqlite3_column_text(stmt, 1);
+        cbm_registry_add_base(registry, owner, base);
+    }
+    sqlite3_finalize(stmt);
+    return step == SQLITE_DONE ? 0 : CBM_NOT_FOUND;
+}
+
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {
     if (!cache) {
         return;
@@ -2014,6 +2057,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     cbm_gbuf_foreach_node(gbuf, registry_visitor, registry);
+    if (registry_seed_bases_from_store(staging, project, registry) != 0) {
+        goto out;
+    }
     cbm_log_info("delta.preseed_done", "registry", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -2689,6 +2735,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_registry_t *registry = cbm_registry_new();
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_foreach_node(existing, registry_visitor, registry);
+    registry_base_seed_t base_seed = {.gbuf = existing, .registry = registry};
+    cbm_gbuf_foreach_edge(existing, registry_base_visitor, &base_seed);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
