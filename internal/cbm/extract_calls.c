@@ -3706,6 +3706,17 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     }
                 }
             }
+            /* Scala has no dedicated LSP resolver yet. Mark receiver calls so
+             * the generic resolver can suppress weak short-name guesses such as
+             * map.get() -> an unrelated project get() or _.register() -> an
+             * arbitrary register(). Import/same-module matches remain eligible. */
+            if (ctx->language == CBM_LANG_SCALA &&
+                strcmp(ts_node_type(node), "call_expression") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "field_expression") == 0) {
+                    call.is_method = true;
+                }
+            }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             /* tree-sitter-elixir attaches NO field name to a call's arguments

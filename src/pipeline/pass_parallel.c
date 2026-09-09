@@ -2168,6 +2168,13 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
         type_hint += PP_CSHARP_M_PREFIX_LEN;
     }
+    /* Scala placeholder receivers (`_.method`) and degenerate convention-only
+     * names (`_`, `m_`) normalize to empty. strstr(candidate, "") matches every
+     * candidate and used to promote the first arbitrary method to confidence
+     * 0.85, so these must fail closed. */
+    if (!type_hint[0]) {
+        return;
+    }
 
     char type_name[CBM_SZ_256];
     snprintf(type_name, sizeof(type_name), "%s", type_hint);
@@ -2182,16 +2189,27 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     const char **cands = NULL;
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
+    const char *matched_qn = NULL;
     for (int ci = 0; ci < cand_count; ci++) {
         if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
-                res->qualified_name = cands[ci];
-                res->confidence = PP_FIELD_HINT_CONF;
-                res->strategy = "field_type_hint";
-                return;
+                /* A naming hint is not enough to choose between identically
+                 * named owners in different packages (for example API v1/v2).
+                 * Keep the registry's lower-confidence result so the
+                 * receiver-aware guard can suppress it instead of depending on
+                 * hash/registry iteration order. */
+                if (matched_qn && strcmp(matched_qn, cands[ci]) != 0) {
+                    return;
+                }
+                matched_qn = cands[ci];
             }
         }
+    }
+    if (matched_qn) {
+        res->qualified_name = matched_qn;
+        res->confidence = PP_FIELD_HINT_CONF;
+        res->strategy = "field_type_hint";
     }
 }
 
@@ -2527,7 +2545,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
-        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+        /* Receiver-aware weak-member suppression (#592/#606/#1276). The
          * receiver-aware guard must NOT drop this call here: doing so would also
          * skip the #523 callee-name service bypass below, emit_service_edge's
          * route/gRPC/config branches, and its unconditional detect_url_in_args
@@ -2543,7 +2561,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * note there. ArkTS belongs to the JS/TS family (#1842). */
         bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                     lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-                                    lang == CBM_LANG_ARKTS;
+                                    lang == CBM_LANG_ARKTS || lang == CBM_LANG_SCALA;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;

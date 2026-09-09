@@ -606,7 +606,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* Dynamic-language weak-member suppression (#592/#606/#1276). A member call
+    /* Receiver-aware weak-member suppression (#592/#606/#1276). A member call
      * x.foo() only reaches the registry when the language's LSP could not
      * resolve the receiver type (the LSP block above already returned for
      * type-resolved calls, including the "resolved but target out of gbuf"
@@ -626,7 +626,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * reintroduce the #592/#606 false-edge class for .ets files. */
     bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                 lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-                                lang == CBM_LANG_ARKTS;
+                                lang == CBM_LANG_ARKTS || lang == CBM_LANG_SCALA;
     /* Bare-call local-binding suppression. A member call has a receiver the
      * guard above can reason about; a bare `run()` has none, so that guard
      * cannot see this class at all. Python-only today because the extraction

@@ -5509,6 +5509,39 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_member_call_flags_is_method) {
+    CBMFileResult *r = extract("object Calls {\n"
+                               "  def helper(): Int = 1\n"
+                               "  def run(xs: Seq[AnyRef], values: Map[String, String]): Int = {\n"
+                               "    xs.foreach(_.register())\n"
+                               "    values.get(\"id\")\n"
+                               "    ReportConverter.convert(1)\n"
+                               "    helper()\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Calls.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int members = 0;
+    int bare = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (strcmp(cn, "_.register") == 0 || strcmp(cn, "values.get") == 0 ||
+            strcmp(cn, "ReportConverter.convert") == 0) {
+            members++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        }
+        if (strcmp(cn, "helper") == 0) {
+            bare++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
+    }
+    ASSERT_EQ(members, 3);
+    ASSERT_EQ(bare, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_companion_owners_are_distinct) {
     CBMFileResult *r = extract(
         "case class ValidateMandatoryInvoiceNumber private (invoice: Invoice) {\n"
@@ -7213,6 +7246,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_member_call_flags_is_method);
     RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
