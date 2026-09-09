@@ -5509,6 +5509,35 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_companion_owners_are_distinct) {
+    CBMFileResult *r = extract(
+        "case class ValidateMandatoryInvoiceNumber private (invoice: Invoice) {\n"
+        "  override lazy val isValid: Boolean = invoice.number.isDefined\n"
+        "  def isMandatory: Boolean = true\n"
+        "}\n"
+        "case object ValidateMandatoryInvoiceNumber {\n"
+        "  def createComponentTasks(invoice: Invoice) =\n"
+        "    List(ValidateMandatoryInvoiceNumber(invoice))\n"
+        "}\n",
+        CBM_LANG_SCALA, "t", "ValidateMandatoryInvoiceNumber.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const char *class_qn = "t.ValidateMandatoryInvoiceNumber.ValidateMandatoryInvoiceNumber";
+    const char *object_qn = "t.ValidateMandatoryInvoiceNumber.ValidateMandatoryInvoiceNumber$";
+    ASSERT_TRUE(has_def_qn(r, class_qn));
+    ASSERT_TRUE(has_def_qn(r, object_qn));
+    ASSERT_TRUE(has_def_qn(
+        r, "t.ValidateMandatoryInvoiceNumber.ValidateMandatoryInvoiceNumber.isValid"));
+    ASSERT_TRUE(has_def_qn(
+        r, "t.ValidateMandatoryInvoiceNumber.ValidateMandatoryInvoiceNumber.isMandatory"));
+    ASSERT_TRUE(has_def_qn(
+        r, "t.ValidateMandatoryInvoiceNumber.ValidateMandatoryInvoiceNumber$.createComponentTasks"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_import_selectors_and_aliases) {
     CBMFileResult *r = extract("import foo.Direct\n"
                                "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
@@ -7184,6 +7213,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);

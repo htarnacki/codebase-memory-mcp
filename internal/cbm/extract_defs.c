@@ -4550,6 +4550,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     } else {
         class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     }
+    /* A Scala class and its companion object are distinct owners despite sharing
+     * the source-level name. Use Scala's conventional singleton-class suffix so
+     * neither container nor their methods overwrite each other in the graph. */
+    if (ctx->language == CBM_LANG_SCALA && cbm_scala_is_companion_object(a, node, ctx->source)) {
+        class_qn = cbm_arena_sprintf(a, "%s$", class_qn);
+    }
     const char *label = class_label_for_kind(kind);
 
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
@@ -5380,14 +5386,17 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
     def.name = name;
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
-    def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
-                                                     qn_name ? qn_name : name, ctx->language);
+    if (ctx->language == CBM_LANG_SCALA && ctx->var_parent_class) {
+        def.qualified_name =
+            cbm_arena_sprintf(a, "%s.%s", ctx->var_parent_class, qn_name ? qn_name : name);
+    } else {
+        def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
+                                                         qn_name ? qn_name : name, ctx->language);
+    }
     def.label = "Variable";
     def.file_path = ctx->rel_path;
-    /* Class-body variables record their declaring class (set by
-     * extract_class_variables); the QN stays module-level as before, so this
-     * is additive metadata that lets cross-file resolution attach the
-     * property to its receiver type. */
+    /* Class-body variables record their declaring class. Scala also qualifies
+     * their QN by that owner; other languages retain their established QN. */
     def.parent_class = ctx->var_parent_class;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
@@ -7251,12 +7260,20 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
             if (saved_enclosing) {
-                return cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
+                return ctx->language == CBM_LANG_SCALA &&
+                               cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+                           ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+                           : qn;
             }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
-            return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
-                                               ctx->language);
+            const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
+                                                         cname, ctx->language);
+            return ctx->language == CBM_LANG_SCALA &&
+                           cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+                       ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+                       : qn;
         }
     }
     return saved_enclosing;
