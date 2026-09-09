@@ -6960,6 +6960,62 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+TEST(tool_trace_path_surfaces_owner_usage_for_framework_dispatch) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "framework-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/framework");
+    cbm_node_t owner = {.project = proj,
+                        .label = "Object",
+                        .name = "OnCreatePlace",
+                        .qualified_name = "framework-proj.pkg.OnCreatePlace.OnCreatePlace",
+                        .file_path = "src/OnCreatePlace.scala",
+                        .start_line = 10,
+                        .end_line = 30};
+    cbm_node_t method = {.project = proj,
+                         .label = "Method",
+                         .name = "handle",
+                         .qualified_name =
+                             "framework-proj.pkg.OnCreatePlace.OnCreatePlace.handle",
+                         .file_path = "src/OnCreatePlace.scala",
+                         .start_line = 14,
+                         .end_line = 22};
+    cbm_node_t boot = {.project = proj,
+                       .label = "Method",
+                       .name = "init",
+                       .qualified_name = "framework-proj.boot.CommandHandlers.init",
+                       .file_path = "src/boot/CommandHandlers.scala",
+                       .start_line = 1,
+                       .end_line = 10};
+    int64_t owner_id = cbm_store_upsert_node(st, &owner);
+    ASSERT_GT(owner_id, 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &method), 0);
+    int64_t boot_id = cbm_store_upsert_node(st, &boot);
+    ASSERT_GT(boot_id, 0);
+    cbm_edge_t usage = {
+        .project = proj, .source_id = boot_id, .target_id = owner_id, .type = "USAGE"};
+    ASSERT_GT(cbm_store_insert_edge(st, &usage), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{"
+             "\"function_name\":\"handle\",\"project\":\"framework-proj\","
+             "\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 0"));
+    ASSERT_NOT_NULL(strstr(inner, "indirect_usage_hint"));
+    ASSERT_NOT_NULL(strstr(inner, "owner_usages_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "CommandHandlers"));
+    ASSERT_NOT_NULL(strstr(inner, "init"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* CONTRACT PIN for the closed strategy vocabulary published by
  * trace_path(include_evidence:true).
  *
@@ -20294,6 +20350,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_reports_engine_saturation_as_lower_bound);
     RUN_TEST(store_bfs_edge_data_is_skippable_and_bounded);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_path_surfaces_owner_usage_for_framework_dispatch);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);

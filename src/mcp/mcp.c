@@ -8690,6 +8690,40 @@ static int trace_watermark_next_index(const cbm_traverse_result_t *tr, int hop, 
     return CBM_NOT_FOUND;
 }
 
+/* A framework entry method often has no static CALLS caller: generated boot
+ * code references its owning handler/validator object and the framework invokes
+ * the override later. Preserve CALLS semantics, but surface those owner-level
+ * USAGE references as an explicit hint instead of presenting an unexplained
+ * zero-caller result. */
+static bool trace_owner_usage_hints(cbm_store_t *store, const char *project,
+                                    const cbm_node_t *method, cbm_traverse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!store || !project || !method || !method->qualified_name || !method->label ||
+        (strcmp(method->label, "Method") != 0 && strcmp(method->label, "Function") != 0)) {
+        return false;
+    }
+    char owner_qn[CBM_SZ_2K];
+    snprintf(owner_qn, sizeof(owner_qn), "%s", method->qualified_name);
+    char *last_dot = strrchr(owner_qn, '.');
+    if (!last_dot) {
+        return false;
+    }
+    *last_dot = '\0';
+    cbm_node_t owner = {0};
+    if (cbm_store_find_node_by_qn(store, project, owner_qn, &owner) != CBM_STORE_OK) {
+        return false;
+    }
+    const char *usage_type[] = {"USAGE"};
+    cbm_store_bfs(store, owner.id, "inbound", usage_type, 1, 1, MCP_COL_16, out);
+    free_node_contents(&owner);
+    if (out->visited_count > 0) {
+        return true;
+    }
+    cbm_store_traverse_free(out);
+    memset(out, 0, sizeof(*out));
+    return false;
+}
+
 /* json-stringified tree for one trace leg: same grouped model as the text
  * output — {cols, groups:[{qn_prefix, rows:[[name,hop,...]]}]}. Optional
  * risk/args columns mirror the flags. */
@@ -9368,6 +9402,10 @@ render_trace_output:;
         }
     }
 
+    cbm_traverse_result_t owner_usages = {0};
+    bool have_owner_usages = do_inbound && in_total == 0 &&
+                             trace_owner_usage_hints(store, project, &nodes[sel], &owner_usages);
+
     free(json);
     json = NULL;
     if (!trace_legacy_json) {
@@ -9405,6 +9443,14 @@ render_trace_output:;
                 bfs_to_adaptive_tree_table(&sb, "callers", &view_in, include_tests, render_evidence,
                                            &in_edge_ctx);
             }
+        }
+        if (have_owner_usages) {
+            cbm_tree_scalar_str(
+                &sb, "indirect_usage_hint",
+                "no direct CALLS callers; the owning symbol has USAGE references and may be "
+                "registered for framework dispatch");
+            cbm_tree_scalar_int(&sb, "owner_usages_total", owner_usages.visited_count);
+            bfs_to_tree_table(&sb, "owner_usages", &owner_usages, include_tests, false, NULL);
         }
         if (trace_truncated) {
             cbm_tree_scalar_bool(&sb, "truncated", true);
@@ -9480,6 +9526,16 @@ render_trace_output:;
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
                                  data_flow && emit_optional_fields,
                                  include_evidence && emit_optional_fields, &in_edge_ctx));
+        }
+        if (have_owner_usages) {
+            yyjson_mut_obj_add_str(
+                doc, root, "indirect_usage_hint",
+                "no direct CALLS callers; the owning symbol has USAGE references and may be "
+                "registered for framework dispatch");
+            yyjson_mut_obj_add_int(doc, root, "owner_usages_total", owner_usages.visited_count);
+            yyjson_mut_obj_add_val(
+                doc, root, "owner_usages",
+                bfs_to_tree_json(doc, &owner_usages, false, include_tests, false, false, NULL));
         }
         if (trace_truncated) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -9627,6 +9683,9 @@ trace_output_ready:
     }
     if (do_inbound) {
         cbm_store_traverse_free(&tr_in);
+    }
+    if (have_owner_usages) {
+        cbm_store_traverse_free(&owner_usages);
     }
 
     cbm_store_free_nodes(nodes, node_count);
