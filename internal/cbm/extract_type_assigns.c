@@ -42,7 +42,8 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
                                             CBMLanguage lang) {
     const char *kind = ts_node_type(rhs);
 
-    if (strcmp(kind, "new_expression") == 0 || strcmp(kind, "object_creation_expression") == 0) {
+    if (strcmp(kind, "new_expression") == 0 || strcmp(kind, "object_creation_expression") == 0 ||
+        (lang == CBM_LANG_SCALA && strcmp(kind, "instance_expression") == 0)) {
         return extract_new_expr_type(a, rhs, source);
     }
 
@@ -163,11 +164,52 @@ static void process_rust_let_type_assign(CBMExtractCtx *ctx, TSNode node, const 
     }
 }
 
+/* Scala exposes an explicit val/var annotation directly as the `type` field.
+ * Keep this stronger signal even when the initializer is not a constructor. */
+static bool process_scala_declared_type_assign(CBMExtractCtx *ctx, TSNode node,
+                                               const char *func_qn) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "val_definition") != 0 && strcmp(kind, "var_definition") != 0 &&
+        strcmp(kind, "val_declaration") != 0 && strcmp(kind, "var_declaration") != 0) {
+        return false;
+    }
+
+    TSNode var_node = ts_node_child_by_field_name(node, TS_FIELD("pattern"));
+    TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+    if (ts_node_is_null(var_node) || strcmp(ts_node_type(var_node), "identifier") != 0) {
+        return true;
+    }
+
+    if (ts_node_is_null(type_node)) {
+        TSNode value_node = ts_node_child_by_field_name(node, TS_FIELD("value"));
+        if (!ts_node_is_null(value_node)) {
+            try_emit_type_assign(ctx, var_node, value_node, func_qn);
+        }
+        return true;
+    }
+
+    char *var_name = cbm_node_text(ctx->arena, var_node, ctx->source);
+    char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
+    if (var_name && var_name[0] && type_name && type_name[0]) {
+        CBMTypeAssign ta = {
+            .var_name = var_name,
+            .type_name = type_name,
+            .enclosing_func_qn = func_qn,
+        };
+        cbm_typeassign_push(&ctx->result->type_assigns, ctx->arena, ta);
+    }
+    return true;
+}
+
 // Process assignment nodes (assignment, short_var_declaration, variable_declarator,
 // let_declaration).
 static void process_type_assign_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                      const char *func_qn) {
     const char *kind = ts_node_type(node);
+
+    if (ctx->language == CBM_LANG_SCALA && process_scala_declared_type_assign(ctx, node, func_qn)) {
+        return;
+    }
 
     if (cbm_kind_in_set(node, spec->assignment_node_types)) {
         process_assignment_type_assign(ctx, node, func_qn);
@@ -208,5 +250,7 @@ void cbm_extract_type_assigns(CBMExtractCtx *ctx) {
 
 void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                          WalkState *state) {
-    process_type_assign_node(ctx, node, spec, state->enclosing_func_qn);
+    process_type_assign_node(ctx, node, spec,
+                             state->enclosing_func_qn ? state->enclosing_func_qn
+                                                      : state->enclosing_class_qn);
 }

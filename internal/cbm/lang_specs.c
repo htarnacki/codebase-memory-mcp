@@ -434,7 +434,7 @@ static const char *scala_class_types[] = {"class_definition", "object_definition
                                           "trait_definition", "enum_definition",
                                           "type_definition",  NULL};
 static const char *scala_module_types[] = {"compilation_unit", NULL};
-static const char *scala_call_types[] = {"call_expression", "infix_expression",
+static const char *scala_call_types[] = {"call_expression", "field_expression", "infix_expression",
                                          "instance_expression", NULL};
 static const char *scala_import_types[] = {"import_declaration", "extends", "import",
                                            "using_directive", NULL};

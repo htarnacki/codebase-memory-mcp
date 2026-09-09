@@ -5542,6 +5542,45 @@ TEST(extract_scala_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_explicit_receiver_types) {
+    CBMFileResult *r = extract("class Holder(val field: Service) {\n"
+                               "  def run(param: Worker): Int = {\n"
+                               "    val local: Helper = new Helper()\n"
+                               "    field.call() + param.work() + local.help()\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Holder.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *holder = find_def_by_name(r, "Holder");
+    ASSERT_NOT_NULL(holder);
+    ASSERT_NOT_NULL(holder->param_names);
+    ASSERT_NOT_NULL(holder->signature_param_types);
+    ASSERT_STR_EQ(holder->param_names[0], "field");
+    ASSERT_STR_EQ(holder->signature_param_types[0], "Service");
+
+    const CBMDefinition *run = find_def_by_name(r, "run");
+    ASSERT_NOT_NULL(run);
+    ASSERT_NOT_NULL(run->param_names);
+    ASSERT_NOT_NULL(run->signature_param_types);
+    ASSERT_STR_EQ(run->param_names[0], "param");
+    ASSERT_STR_EQ(run->signature_param_types[0], "Worker");
+
+    int local_types = 0;
+    for (int i = 0; i < r->type_assigns.count; i++) {
+        const CBMTypeAssign *ta = &r->type_assigns.items[i];
+        if (ta->var_name && strcmp(ta->var_name, "local") == 0) {
+            local_types++;
+            ASSERT_STR_EQ(ta->type_name, "Helper");
+            ASSERT_STR_EQ(ta->enclosing_func_qn, run->qualified_name);
+        }
+    }
+    ASSERT_EQ(local_types, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_companion_owners_are_distinct) {
     CBMFileResult *r = extract(
         "case class ValidateMandatoryInvoiceNumber private (invoice: Invoice) {\n"
@@ -7247,6 +7286,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_scala_member_call_flags_is_method);
+    RUN_TEST(extract_scala_explicit_receiver_types);
     RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);

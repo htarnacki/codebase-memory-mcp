@@ -347,6 +347,9 @@ static bool fp_is_apply_kind(const char *kind) {
 }
 
 static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "field_expression") == 0) {
+        return cbm_node_text(a, node, source);
+    }
     /* Curried application `f a b …` nests one apply node per argument on the
      * function head. Walk that left spine iteratively: recursing once per
      * application makes stack use follow the parse-tree depth of the indexed
@@ -3640,8 +3643,18 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         invocation = describe_callable_reference(ctx, node);
     }
 
-    if (!callable_reference && spec->call_node_types && spec->call_node_types[0] &&
-        cbm_kind_in_set(node, spec->call_node_types)) {
+    bool scala_field_selection =
+        ctx->language == CBM_LANG_SCALA && strcmp(ts_node_type(node), "field_expression") == 0;
+    bool nested_explicit_callee = false;
+    if (scala_field_selection) {
+        TSNode parent = ts_node_parent(node);
+        TSNode function = ts_node_is_null(parent)
+                              ? (TSNode){0}
+                              : ts_node_child_by_field_name(parent, TS_FIELD("function"));
+        nested_explicit_callee = !ts_node_is_null(function) && ts_node_eq(function, node);
+    }
+    if (!callable_reference && !nested_explicit_callee && spec->call_node_types &&
+        spec->call_node_types[0] && cbm_kind_in_set(node, spec->call_node_types)) {
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
@@ -3654,6 +3667,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
+            /* A bare Scala receiver selection can invoke a method whose entire
+             * parameter list is implicit (`handler.createInvoice`). Syntax
+             * alone cannot distinguish it from reading a field, so require the
+             * typed-receiver resolver to prove a concrete callable target. */
+            if (scala_field_selection) {
+                call.is_method = true;
+                call.requires_lsp_resolution = true;
+            }
             // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
             // generic short-name resolver cannot place a method without a known
             // receiver type, so the call-resolution pass suppresses those edges.

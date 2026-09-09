@@ -2155,6 +2155,51 @@ static const char **make_single_base(CBMArena *a, const char *text) {
     return result;
 }
 
+static const char **extract_scala_bases(CBMArena *a, TSNode node, const char *source) {
+    TSNode clause = ts_node_child_by_field_name(node, TS_FIELD("extend"));
+    if (ts_node_is_null(clause)) {
+        clause = cbm_find_child_by_kind(node, "extends_clause");
+    }
+    if (ts_node_is_null(clause)) {
+        return NULL;
+    }
+    const char *bases[MAX_BASES];
+    int count = 0;
+    uint32_t nc = ts_node_child_count(clause);
+    for (uint32_t i = 0; i < nc && count < MAX_BASES_MINUS_1; i++) {
+        const char *field = ts_node_field_name_for_child(clause, i);
+        TSNode child = ts_node_child(clause, i);
+        if (!field || strcmp(field, "type") != 0 || !ts_node_is_named(child) ||
+            strcmp(ts_node_type(child), "with") == 0) {
+            continue;
+        }
+        TSNode name = child;
+        if (strcmp(ts_node_type(child), "generic_type") == 0) {
+            TSNode inner = ts_node_child_by_field_name(child, TS_FIELD("type"));
+            if (!ts_node_is_null(inner)) {
+                name = inner;
+            }
+        }
+        char *text = cbm_node_text(a, name, source);
+        if (text && text[0]) {
+            bases[count++] = text;
+        }
+    }
+    if (count == 0) {
+        return NULL;
+    }
+    const char **result =
+        (const char **)cbm_arena_alloc(a, (size_t)(count + NULL_TERM) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        result[i] = bases[i];
+    }
+    result[count] = NULL;
+    return result;
+}
+
 // Search children for a child matching one of the base_types and return its text as single base.
 static const char **find_base_from_children(CBMArena *a, TSNode node, const char *source,
                                             const char **base_types) {
@@ -2542,6 +2587,12 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    if (lang == CBM_LANG_SCALA) {
+        const char **scala_bases = extract_scala_bases(a, node, source);
+        if (scala_bases) {
+            return scala_bases;
+        }
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -2921,9 +2972,10 @@ static char *resolve_param_name(CBMArena *a, TSNode param, const char *source) {
         return cbm_node_text(a, param, source);
     }
     if (strcmp(pk, "formal_parameter") == 0 || strcmp(pk, "parameter") == 0 ||
-        strcmp(pk, "required_parameter") == 0 || strcmp(pk, "optional_parameter") == 0 ||
-        strcmp(pk, "simple_parameter") == 0 || strcmp(pk, "typed_parameter") == 0 ||
-        strcmp(pk, "default_parameter") == 0 || strcmp(pk, "typed_default_parameter") == 0) {
+        strcmp(pk, "class_parameter") == 0 || strcmp(pk, "required_parameter") == 0 ||
+        strcmp(pk, "optional_parameter") == 0 || strcmp(pk, "simple_parameter") == 0 ||
+        strcmp(pk, "typed_parameter") == 0 || strcmp(pk, "default_parameter") == 0 ||
+        strcmp(pk, "typed_default_parameter") == 0) {
         TSNode nm = ts_node_child_by_field_name(param, TS_FIELD("name"));
         if (ts_node_is_null(nm)) {
             nm = ts_node_child_by_field_name(param, TS_FIELD("pattern"));
@@ -4642,6 +4694,22 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
+    /* Scala primary-constructor parameters are lexical bindings throughout the
+     * class body. Preserve their ordered names/types on the class definition so
+     * receiver-aware call resolution can use them without guessing by name. */
+    if (ctx->language == CBM_LANG_SCALA) {
+        TSNode params = ts_node_child_by_field_name(node, TS_FIELD("class_parameters"));
+        if (ts_node_is_null(params)) {
+            params = cbm_find_child_by_kind(node, "class_parameters");
+        }
+        if (!ts_node_is_null(params)) {
+            def.signature = cbm_node_text(a, params, ctx->source);
+            def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
+            def.signature_param_types = extract_signature_param_types(
+                a, params, ctx->source, ctx->language, false, &def.signature_param_count);
+        }
+    }
+
     cbm_defs_push(&ctx->result->defs, a, def);
 
     if (strcmp(label, "Enum") == 0) {
@@ -4959,6 +5027,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     TSNode params = find_function_params(child, ctx->language);
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
+        if (ctx->language == CBM_LANG_SCALA) {
+            def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
+        }
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
         def.signature_param_types = extract_signature_param_types(
             a, params, ctx->source, ctx->language, true, &def.signature_param_count);
