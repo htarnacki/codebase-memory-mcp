@@ -289,6 +289,7 @@ enum {
     FW_SIGNATURE = 10, /* ×1.0 */
     FW_PARAM = 10,     /* ×1.0 */
     FW_PATTERN = 25,   /* ×2.5 — injected semantic tokens are high value */
+    FW_QN = 5,         /* ×0.5 — package/module vocabulary is weak context */
     FW_PATH = 5,       /* ×0.5 */
     FW_SCALE = 10,     /* divisor */
 };
@@ -462,36 +463,67 @@ static int tokenize_call_neighbors(const cbm_gbuf_node_t *n, const cbm_gbuf_t *g
     return count;
 }
 
+static void set_field_weight(float *weights, int from, int to, int field_weight) {
+    float weight = (float)field_weight / (float)FW_SCALE;
+    for (int i = from; i < to; i++) {
+        weights[i] = weight;
+    }
+}
+
 static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, char **tokens,
-                         int max_tokens) {
+                         float *field_weights, int max_tokens) {
     int count = 0;
+    int start = count;
     count += cbm_sem_tokenize(n->name, tokens + count, max_tokens - count);
+    set_field_weight(field_weights, start, count, FW_NAME);
     if (n->qualified_name && count < max_tokens) {
+        start = count;
         count += cbm_sem_tokenize(n->qualified_name, tokens + count, max_tokens - count);
+        set_field_weight(field_weights, start, count, FW_QN);
     }
     if (n->file_path && count < max_tokens) {
+        start = count;
         count += cbm_sem_tokenize(n->file_path, tokens + count, max_tokens - count);
+        set_field_weight(field_weights, start, count, FW_PATH);
     }
     if (n->properties_json) {
+        start = count;
         count =
             tokenize_json_string_field(n->properties_json, "signature", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_SIGNATURE);
+        start = count;
         count = tokenize_json_string_field(n->properties_json, "return_type", tokens, count,
                                            max_tokens);
+        set_field_weight(field_weights, start, count, FW_SIGNATURE);
+        start = count;
         count =
             tokenize_json_string_field(n->properties_json, "docstring", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_BODY);
+        start = count;
         count =
             tokenize_json_array_field(n->properties_json, "param_names", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_PARAM);
+        start = count;
         count =
             tokenize_json_array_field(n->properties_json, "param_types", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_PARAM);
+        start = count;
         count =
             tokenize_json_array_field(n->properties_json, "decorators", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_SIGNATURE);
+        start = count;
         count = tokenize_json_string_field(n->properties_json, "bt", tokens, count, max_tokens);
+        set_field_weight(field_weights, start, count, FW_BODY);
     }
+    start = count;
     count = tokenize_call_neighbors(n, gbuf, /*outbound=*/true, tokens, count, max_tokens);
+    set_field_weight(field_weights, start, count, FW_CALLEE);
 
     /* Caller names: what CALLS this function (contextual vocabulary).
      * Functions called by error handlers inherit "error" context. */
+    start = count;
     count = tokenize_call_neighbors(n, gbuf, /*outbound=*/false, tokens, count, max_tokens);
+    set_field_weight(field_weights, start, count, FW_CALLEE);
     return count;
 }
 
@@ -598,6 +630,7 @@ typedef struct {
     const cbm_gbuf_node_t **node_ptrs; /* node pointer per function index */
     cbm_gbuf_t *gbuf;                  /* read-only during tokenization */
     char **all_tokens;                 /* output: all_tokens[f * MAX + t] */
+    float *all_field_weights;          /* output: source-field multiplier per token */
     int *token_counts;                 /* output: token count per function */
     int func_count;
     _Atomic int next_idx;
@@ -622,8 +655,11 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
          * in this slot, which avoids a spurious analyzer "leak" diagnostic on
          * the previous stack-local relay pattern. */
         char **dst = &tc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
-        int count = tokenize_node(n, tc->gbuf, dst, CBM_SEM_MAX_TOKENS);
+        float *field_weights = &tc->all_field_weights[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
+        int count = tokenize_node(n, tc->gbuf, dst, field_weights, CBM_SEM_MAX_TOKENS);
+        int pattern_start = count;
         count = inject_pattern_tokens(n, tc->gbuf, dst, count, CBM_SEM_MAX_TOKENS);
+        set_field_weight(field_weights, pattern_start, count, FW_PATTERN);
         if (tc->pools && tc->pools[worker_id]) {
             CBMHashTable *pool = tc->pools[worker_id];
             for (int t = 0; t < count; t++) {
@@ -645,6 +681,7 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
 typedef struct {
     cbm_sem_func_t *funcs;
     char **all_tokens;
+    float *all_field_weights;
     int *token_counts;
     cbm_sem_corpus_t *corpus;
     uint8_t *qvecs; /* output: pre-quantized int8 vectors [func_count * CBM_SEM_DIM] */
@@ -663,6 +700,7 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
 
         int tc = vc->token_counts[f];
         char **tokens = &vc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
+        float *field_weights = &vc->all_field_weights[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
 
         /* TF-IDF weights */
         int *indices = malloc((size_t)tc * sizeof(int));
@@ -672,7 +710,7 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
             float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
             if (idf > 0.0F) {
                 indices[tfidf_len] = t;
-                weights[tfidf_len] = idf;
+                weights[tfidf_len] = idf * field_weights[t];
                 tfidf_len++;
             }
         }
@@ -689,7 +727,7 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
             const cbm_sem_vec_t *ri = cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
             if (ri) {
                 float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-                cbm_sem_vec_add_scaled(&ri_dense, ri, idf);
+                cbm_sem_vec_add_scaled(&ri_dense, ri, idf * field_weights[t]);
             }
         }
         cbm_sem_normalize(&ri_dense);
@@ -1165,12 +1203,13 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
 /* Phase 2: tokenize each function's metadata in parallel, filling
  * all_tokens[] and token_counts[].  Caller allocates the arrays. */
 static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
-                            int *token_counts, int func_count, int worker_count,
-                            CBMHashTable **pools) {
+                            float *all_field_weights, int *token_counts, int func_count,
+                            int worker_count, CBMHashTable **pools) {
     tokenize_ctx_t tc = {
         .node_ptrs = node_ptrs,
         .gbuf = gbuf,
         .all_tokens = all_tokens,
+        .all_field_weights = all_field_weights,
         .token_counts = token_counts,
         .func_count = func_count,
         .pools = pools,
@@ -1184,9 +1223,9 @@ static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf,
  * int8-quantized qvecs for subsequent storage.  Phase 4b runs sequentially
  * to store them in gbuf because gbuf is not thread-safe. */
 static void phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs,
-                                           char **all_tokens, int *token_counts,
-                                           cbm_sem_corpus_t *corpus, int func_count,
-                                           int worker_count) {
+                                           char **all_tokens, float *all_field_weights,
+                                           int *token_counts, cbm_sem_corpus_t *corpus,
+                                           int func_count, int worker_count) {
     uint8_t *qvecs = malloc((size_t)func_count * CBM_SEM_DIM);
     if (!qvecs) {
         return;
@@ -1194,6 +1233,7 @@ static void phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
     vec_build_ctx_t vc = {
         .funcs = funcs,
         .all_tokens = all_tokens,
+        .all_field_weights = all_field_weights,
         .token_counts = token_counts,
         .corpus = corpus,
         .qvecs = qvecs,
@@ -1390,7 +1430,17 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     /* Phase 2: Tokenize all nodes (PARALLEL) */
     int worker_count = cbm_default_worker_count(false);
     char **all_tokens = malloc((size_t)func_count * sizeof(char *) * CBM_SEM_MAX_TOKENS);
+    float *all_field_weights = malloc((size_t)func_count * sizeof(float) * CBM_SEM_MAX_TOKENS);
     int *token_counts = calloc((size_t)func_count, sizeof(int));
+    if (!all_tokens || !all_field_weights || !token_counts) {
+        free(all_tokens);
+        free(all_field_weights);
+        free(token_counts);
+        free(funcs);
+        free(node_ptrs);
+        cbm_log_error("pass.semantic.alloc_failed", "phase", "tokenize");
+        return -1;
+    }
 
     CBM_PROF_START(t_phase2);
     CBMHashTable **token_pools = calloc((size_t)worker_count, sizeof(CBMHashTable *));
@@ -1399,8 +1449,8 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
             token_pools[w] = cbm_ht_create(CBM_SZ_1K);
         }
     }
-    phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
-                    token_pools);
+    phase2_tokenize(node_ptrs, gbuf, all_tokens, all_field_weights, token_counts, func_count,
+                    worker_count, token_pools);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
 
@@ -1409,8 +1459,8 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     /* Phase 4: Build per-function TF-IDF + RI vectors (PARALLEL) and store them. */
     CBM_PROF_START(t_phase4);
-    phase4_build_and_store_vectors(gbuf, funcs, all_tokens, token_counts, corpus, func_count,
-                                   worker_count);
+    phase4_build_and_store_vectors(gbuf, funcs, all_tokens, all_field_weights, token_counts, corpus,
+                                   func_count, worker_count);
     CBM_PROF_END_N("semantic_edges", "4_build_and_store_vec", t_phase4, func_count);
 
     cbm_log_info("pass.semantic.vectors_stored", "count", itoa_log(func_count));
@@ -1435,6 +1485,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     free(signatures);
     cbm_log_info("pass.done", "pass", "semantic_edges", "edges", itoa_log(total_edges));
     free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools, worker_count);
+    free(all_field_weights);
     free(token_counts);
     cbm_sem_corpus_free(corpus);
     CBM_PROF_END("semantic_edges", "7_cleanup", t_phase7);
